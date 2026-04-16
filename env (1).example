@@ -1,0 +1,11 @@
+# ── Provider selection ─────────────────────────────────────────────────────────
+# Which LLM web interface to automate.
+# Choices: gemini | chatgpt | claude
+TARGET_PROVIDER=gemini
+
+# ── Optional overrides ─────────────────────────────────────────────────────────
+# Override the default URL for the chosen provider (usually not needed)
+# TARGET_URL=https://gemini.google.com
+
+# Chrome remote debugging port (default: 9222)
+# CHROME_DEBUG_PORT=9222
