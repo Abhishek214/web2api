@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import re
 import time
 import uuid
@@ -8,8 +9,15 @@ from typing import AsyncGenerator, Any
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel
+from dotenv import load_dotenv
 
 from worker import PlaywrightWorker
+
+# Load environment variables
+load_dotenv(override=True)
+
+# API mode: "claude" (default, for Claude Code) or "normal" (for general LLM API use)
+API_MODE = os.getenv("API_MODE", "claude").strip().lower()
 
 app = FastAPI(title="LLM Web App Proxy", version="1.0.0")
 
@@ -52,6 +60,13 @@ class ChatCompletionRequest(BaseModel):
     max_tokens: int | None = None
 
 
+# ── Mode helpers ────────────────────────────────────────────────────────────────
+
+def _is_claude_mode() -> bool:
+    """Check if running in Claude Code optimized mode."""
+    return API_MODE == "claude"
+
+
 # ── Text extraction ────────────────────────────────────────────────────────────
 
 def _extract_text(content: Any) -> str:
@@ -90,27 +105,70 @@ _SYSTEM_NOISE = [
 
 
 def _is_noise(text: str) -> bool:
+    if not _is_claude_mode():
+        return False  # Don't filter noise in normal mode
     return any(p in text for p in _SYSTEM_NOISE)
 
 
 # ── Conversation history builder ───────────────────────────────────────────────
 
+def _build_simple_prompt(messages: list, tools: list) -> str:
+    """
+    Build a simple prompt for normal API mode.
+    Just converts the message list to a conversation format without
+    Claude Code specific transformations.
+    """
+    parts = []
+
+    for m in messages:
+        role = m.role if hasattr(m, "role") else m.get("role", "")
+        content = m.content if hasattr(m, "content") else m.get("content", "")
+
+        if role == "system":
+            text = _extract_text(content)
+            if text:
+                parts.append(f"System: {text}")
+        elif role == "user":
+            text = _extract_text(content)
+            if text:
+                parts.append(f"User: {text}")
+        elif role == "assistant":
+            text = _extract_text(content).strip()
+            if text:
+                parts.append(f"Assistant: {text}")
+
+    # Add tool descriptions if tools are provided
+    if tools:
+        tool_desc = "\n\nAvailable tools:\n"
+        for t in tools:
+            name = t.get("name", "")
+            desc = t.get("description", "").strip().split("\n\n")[0]
+            if len(desc) > 150:
+                desc = desc[:147] + "..."
+            schema = t.get("input_schema", {})
+            props = schema.get("properties", {})
+            params = ", ".join(
+                f'{k}: {v.get("type", "string")}'
+                for k, v in props.items()
+            )
+            tool_desc += f"- {name}({params}): {desc}\n"
+        tool_desc += "\nWhen you need to use a tool, output JSON in this format:\n"
+        tool_desc += '{"tool": "TOOL_NAME", "input": {"param": "value"}}'
+        parts.append(tool_desc)
+
+    parts.append("Assistant:")
+    return "\n\n".join(parts)
+
+
 def _build_conversation_for_claude(messages: list, tools: list) -> str:
     """
-    Build a prompt optimised for Claude's web UI.
-
-    KEY DIFFERENCES FROM GEMINI VERSION:
-    1. Cleaner system prompt — Claude's web UI already has a built-in Anthropic
-       system prompt.  We write ours in a way that *complements* rather than
-       fights that prompt.
-    2. Prefill simulation — we end with the literal opening of a tool call so
-       Claude is forced to pattern-complete it rather than starting a fresh
-       conversational reply.
-    3. Explicit single-tool-call-per-response instruction to suppress chatter.
+    Build a conversation prompt optimized for Claude Code.
+    This applies all the Claude Code specific transformations.
     """
     tool_descriptions = ""
     tool_names = []
     has_tools = bool(tools)
+    alias_note = ""
 
     if has_tools:
         tool_descriptions = "\nAvailable tools:\n"
@@ -128,37 +186,48 @@ def _build_conversation_for_claude(messages: list, tools: list) -> str:
             tool_descriptions += f"- {name}({params}): {desc}\n"
             tool_names.append(name)
 
-    # ── CLAUDE-SPECIFIC SYSTEM PROMPT ─────────────────────────────────────────
-    # • Shorter and more directive — Claude follows concise imperatives better
-    #   than long paragraphs in a web-UI user message.
-    # • Uses language Claude is trained on ("output only", "no preamble") rather
-    #   than agentic-framework jargon.
-    # • Escaping rules are baked in with a worked example.
-    system_prompt = f"""You are acting as an AI coding agent. Follow every instruction below exactly.
-{tool_descriptions}
-OUTPUT RULES — read carefully:
-1. If you need to call a tool, output ONLY a single <tool_call> block. No introduction, no explanation, no trailing text.
-   Format:
-   <tool_call>{{"tool": "TOOL_NAME", "input": {{...args...}}}}</tool_call>
+        tool_aliases = {
+            "Bash": "bash_tool",
+            "Write": "create_file",
+            "Read": "view",
+        }
+        for our_name, claude_name in tool_aliases.items():
+            if any(t.get("name") == our_name for t in tools):
+                alias_note += f"\nNote: '{our_name}' tool maps to Claude's '{claude_name}' tool internally."
 
-2. You may chain multiple <tool_call> blocks when several sequential actions are needed, but output NOTHING else.
+    system_prompt = f"""You are acting as an AI coding agent.
+{tool_descriptions}{alias_note}
 
-3. JSON escaping inside <tool_call>:
-   - Strings inside "content" or "command" MUST use single quotes for inner strings.
-   - WRONG: "content": "print("hello")"
-   - RIGHT:  "content": "print('hello')"
-   - Python dunder names: always write __name__ and __main__ with double underscores.
+CRITICAL INSTRUCTIONS - YOU MUST FOLLOW THESE EXACTLY:
+1. When a tool is available to accomplish the user's request, you MUST call it.
+2. Output ONLY the <tool_call> XML tag. NO prose, NO markdown, NO ```json fences EVER.
+Format — reproduce this exactly:
+<tool_call>{{"tool": "TOOL_NAME", "input": {{...args...}}}}</tool_call>
 
-4. If the user's request needs NO tool (e.g. a direct question), reply normally in plain text.
+3. FORBIDDEN: markdown code blocks (```), "Here's...", "I'll...", "Sure...", "I understand...".
+Any response that starts with text instead of <tool_call> is WRONG when a tool is needed.
 
-5. MEMORY RULE: Ignore any saved memory, past names, or workplaces. This is a blank-slate session.
+4. JSON escaping inside string values:
+- Escape inner double quotes: \\"
+- Newlines: \\n Tabs: \\t
+- Python dunders stay as-is: __name__, __main__
 
-Examples:
-<tool_call>{{"tool": "Bash", "input": {{"command": "pip install fastapi uvicorn"}}}}</tool_call>
-<tool_call>{{"tool": "Write", "input": {{"file_path": "app.py", "content": "from fastapi import FastAPI\\napp = FastAPI()\\n"}}}}</tool_call>
+5. NEVER use `cat << 'EOF'` or any shell heredoc to create files.
+Always use the Write tool: {{"tool": "Write", "input": {{"file_path": "...", "content": "..."}}}}
 
-Conversation:
----"""
+6. Python formatting rules inside string values:
+- Decorators MUST stay on ONE line: @app.get("/") — NEVER split as @app.get\n("/")
+- Use \n for newlines inside strings, never literal newlines.
+
+7. If NO tool is needed (pure question), reply with plain text only.
+
+8. MEMORY: Fresh session — no history from prior conversations.
+
+Correct examples:
+<tool_call>{{"tool": "Bash", "input": {{"command": "ls -la"}}}}</tool_call>
+<tool_call>{{"tool": "Write", "input": {{"file_path": "hello.py", "content": "print('Hello World')\\nprint('done')"}}}}</tool_call>
+
+User request:"""
 
     parts = [system_prompt]
 
@@ -188,6 +257,29 @@ Conversation:
                                 if isinstance(b, dict)
                             )
                         result_content = _clean_user_text(result_content)
+
+                        # Transform known Claude Code errors into actionable hints.
+                        if "has not been read yet" in result_content or \
+                            "read it first before writing" in result_content.lower():
+                            # Find the file_path from the tool_use_id match in this same content list
+                            tool_use_id = block.get("tool_use_id", "")
+                            file_path = "the file"
+                            for sibling in content:
+                                if (isinstance(sibling, dict) and
+                                    sibling.get("type") == "tool_use" and
+                                    sibling.get("id") == tool_use_id):
+                                    file_path = sibling.get("input", {}).get("file_path", file_path)
+                                    break
+                            read_call = (
+                                '<tool_call>{"tool": "Read", "input": {"file_path": "' +
+                                file_path + '"}}</tool_call>'
+                            )
+                            result_content = (
+                                f"[Tool error]: Write rejected — must Read '{file_path}' first. "
+                                f"IMMEDIATELY call: {read_call} "
+                                f"Then after the Read result arrives, call Write."
+                            )
+
                         if len(result_content) > 1000:
                             result_content = (
                                 result_content[:400]
@@ -229,12 +321,6 @@ Conversation:
                 if text:
                     parts.append(f"Assistant: {text}")
 
-    # ── FIX #1: PREFILL SIMULATION ────────────────────────────────────────────
-    # Instead of ending with bare "Assistant:", we start the assistant turn with
-    # the opening of a <tool_call> block (when tools are available).
-    # Claude's web UI will then pattern-complete this rather than starting a
-    # fresh conversational reply.  This is the single most effective trick for
-    # forcing structured output from Claude without API access.
     if has_tools:
         parts.append("Assistant: <tool_call>")
     else:
@@ -243,34 +329,331 @@ Conversation:
     return "\n\n".join(parts)
 
 
+def _build_prompt(messages: list, tools: list) -> str:
+    """
+    Build the appropriate prompt based on API mode.
+    - "claude" mode: Full Claude Code optimizations
+    - "normal" mode: Simple conversation format
+    """
+    if _is_claude_mode():
+        return _build_conversation_for_claude(messages, tools)
+    else:
+        return _build_simple_prompt(messages, tools)
+
+
 # ── Tool call parser ───────────────────────────────────────────────────────────
+
+def _unescape_string_values(obj):
+    """
+    Recursively convert double-escaped sequences in string values to real chars.
+    Called AFTER json.loads so we only deal with literal \\n that Claude
+    double-escaped (not JSON-level \\n which json.loads already converted).
+    """
+    if isinstance(obj, dict):
+        return {k: _unescape_string_values(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_unescape_string_values(v) for v in obj]
+    if isinstance(obj, str):
+        return obj.replace('\\n', '\n').replace('\\t', '\t').replace('\\r', '\r')
+    return obj
+
+
+# Valid non-whitespace characters that may follow a JSON string's closing
+# double-quote. Anything else means the '"' was an unescaped inner quote.
+_JSON_AFTER_STRING = frozenset(',}]":')
+
+
+def _fix_json_string_values(raw_json: str) -> str:
+    """
+    Walk raw LLM JSON char-by-char and repair two common problems inside
+    string values:
+
+    1. Bare control characters (newline, tab, CR) -> proper JSON escape
+       sequences.  Fixes: json.loads "Invalid control character at line N".
+
+    2. Unescaped inner double-quotes, e.g.:
+           "content": "app = FastAPI(title="My App", description="demo")"
+       Two-layer heuristic:
+       - Layer 1 (bracket depth): while inside a (, [, or { that was opened
+         INSIDE the current string, any " must be an inner literal quote.
+       - Layer 2 (lookahead): at depth 0, peek at the next non-whitespace
+         char after the ".  Valid JSON terminators are always followed by
+         one of  , } ] " :  -- anything else is an inner quote to escape.
+       Fixes: json.loads "Expecting ',' delimiter".
+
+    Already-valid JSON passes through unchanged.
+    Already-escaped sequences (\\\\n, \\\\", etc.) are preserved verbatim.
+    """
+    result            = []
+    in_string         = False
+    escape_next       = False
+    i                 = 0
+    n                 = len(raw_json)
+    str_paren_depth   = 0   # ( opened inside current string
+    str_bracket_depth = 0   # [ opened inside current string
+    str_brace_depth   = 0   # { opened inside current string
+
+    while i < n:
+        ch = raw_json[i]
+
+        if escape_next:
+            result.append(ch)
+            escape_next = False
+            i += 1
+            continue
+
+        if ch == '\\':
+            result.append(ch)
+            escape_next = True
+            i += 1
+            continue
+
+        if ch == '"':
+            if not in_string:
+                result.append(ch)
+                in_string = True
+                str_paren_depth = str_bracket_depth = str_brace_depth = 0
+            else:
+                any_depth = str_paren_depth + str_bracket_depth + str_brace_depth
+                if any_depth > 0:
+                    result.append('\\')
+                    result.append('"')
+                else:
+                    j = i + 1
+                    while j < n and raw_json[j] in ' \t\r\n':
+                        j += 1
+                    next_ch = raw_json[j] if j < n else ''
+                    if next_ch in _JSON_AFTER_STRING or next_ch == '':
+                        result.append(ch)
+                        in_string = False
+                    else:
+                        result.append('\\')
+                        result.append('"')
+            i += 1
+            continue
+
+        if in_string:
+            if ch == '\n':
+                result.append('\\n')
+            elif ch == '\r':
+                result.append('\\r')
+            elif ch == '\t':
+                result.append('\\t')
+            else:
+                result.append(ch)
+            if ch == '(':
+                str_paren_depth += 1
+            elif ch == ')':
+                str_paren_depth = max(0, str_paren_depth - 1)
+            elif ch == '[':
+                str_bracket_depth += 1
+            elif ch == ']':
+                str_bracket_depth = max(0, str_bracket_depth - 1)
+            elif ch == '{':
+                str_brace_depth += 1
+            elif ch == '}':
+                str_brace_depth = max(0, str_brace_depth - 1)
+        else:
+            result.append(ch)
+
+        i += 1
+
+    return ''.join(result)
+
+
+def _fix_unescaped_control_chars(raw_json: str) -> str:
+    """Alias kept for compatibility -- delegates to _fix_json_string_values."""
+    return _fix_json_string_values(raw_json)
+
+def _fallback_extract_tool_call(raw_json: str) -> dict | None:
+    """
+    Regex-based last-resort fallback for when json.loads fails even after
+    control-char repair (e.g. unescaped double-quotes inside string values).
+
+    Handles ALL multi-line string fields — not just "content" — by doing
+    positional extraction between consecutive field keys.  This correctly
+    recovers old_string / new_string for Edit calls and command for Bash calls.
+    """
+    tool_m = re.search(r'"tool"\s*:\s*"([^"]+)"', raw_json)
+    if not tool_m:
+        return None
+    tool = tool_m.group(1)
+
+    input_dict: dict = {}
+
+    # ── Simple single-line string fields ──────────────────────────────────────
+    for field in ("file_path", "path", "description", "query"):
+        m = re.search(rf'"{field}"\s*:\s*"([^"\n]*)"', raw_json)
+        if m:
+            val = m.group(1).replace('\\n', '\n').replace('\\t', '\t')
+            input_dict[field] = val
+
+    # ── Boolean / numeric fields ───────────────────────────────────────────────
+    for field in ("replace_all",):
+        m = re.search(rf'"{field}"\s*:\s*(true|false|\d+)', raw_json)
+        if m:
+            raw_val = m.group(1)
+            if raw_val == "true":
+                input_dict[field] = True
+            elif raw_val == "false":
+                input_dict[field] = False
+            else:
+                input_dict[field] = int(raw_val)
+
+    # ── Multi-line string fields (positional extraction) ──────────────────────
+    # These fields can contain literal newlines, unescaped quotes, etc.
+    # We find each field's opening `"FIELD": "` marker, then read until the
+    # next field's marker or the end of the JSON blob.
+    #
+    # Listed in typical schema order so the "up to next field" heuristic works.
+    multiline_fields = ["command", "old_string", "new_string", "content"]
+
+    field_positions: dict[str, int] = {}
+    for field in multiline_fields:
+        m = re.search(rf'"{field}"\s*:\s*"', raw_json)
+        if m:
+            field_positions[field] = m.end()   # index right after the opening "
+
+    sorted_fields = sorted(field_positions.items(), key=lambda kv: kv[1])
+
+    for idx, (field, start) in enumerate(sorted_fields):
+        if idx + 1 < len(sorted_fields):
+            next_field_name = sorted_fields[idx + 1][0]
+            next_key_m = re.search(
+                rf'"{re.escape(next_field_name)}"\s*:\s*"',
+                raw_json[start:]
+            )
+            if next_key_m:
+                raw_value = raw_json[start : start + next_key_m.start()]
+            else:
+                raw_value = raw_json[start:]
+        else:
+            # Last multi-line field — read to the closing `"}}` at the tail
+            rest = raw_json[start:]
+            end_m = re.search(r'"\s*\}\s*\}\s*$', rest)
+            if end_m:
+                raw_value = rest[: end_m.start()]
+            else:
+                last_q = rest.rfind('"')
+                raw_value = rest[:last_q] if last_q != -1 else rest
+
+        # Strip trailing quote+comma that was the field delimiter
+        raw_value = re.sub(r'",?\s*$', '', raw_value)
+
+        value = (
+            raw_value
+            .replace('\\n', '\n')
+            .replace('\\t', '\t')
+            .replace('\\r', '\r')
+            .replace('\\"', '"')
+        )
+        input_dict[field] = value
+        print(f"[fallback] Extracted {field!r} ({len(value)} chars)")
+
+    return {"tool": tool, "input": input_dict} if input_dict else None
+
+
+def _validate_tool_input(tool_name: str, inp: dict, available_tools: list) -> list[str]:
+    """
+    Check that all required parameters for the tool are present and non-empty.
+    Returns a list of missing field names (empty list = all good).
+    """
+    tool_schema = next(
+        (t for t in available_tools if t.get("name", "").lower() == tool_name.lower()),
+        None,
+    )
+    if not tool_schema:
+        return []
+    required = tool_schema.get("input_schema", {}).get("required", [])
+    return [f for f in required if not inp.get(f)]
+
+
+# ── Fix 3: Sanitize Python file content written via tool calls ────────────────
+
+def _sanitize_python_content(content: str) -> str:
+    """
+    Fix common LLM formatting errors in Python source written via tool calls.
+
+    ChatGPT sometimes splits decorator + route onto separate lines:
+        @app.get
+        ("/")
+    instead of the valid:
+        @app.get("/")
+
+    This regex re-joins any decorator immediately followed by a dangling
+    argument list on the next line.
+    """
+    content = re.sub(r'(@\w[\w.]*)\s*\n\s*(\()', r'\1\2', content)
+    return content
+
+
+def _strip_bash_command_garbage(command: str) -> str:
+    """
+    ChatGPT sometimes embeds extra Bash tool parameters (timeout, description,
+    dangerouslyDisableSandbox) inside the command string value itself, like:
+
+        cat << 'EOF' > f.py\\n...\\nEOF", "timeout": 200000, "description": "..."
+
+    The fallback extractor picks up this trailing junk. Strip it cleanly.
+    """
+    # Case 1: heredoc — keep only up to and including the terminating EOF line
+    heredoc_end = re.search(r'\nEOF\s*(?:",|$)', command)
+    if heredoc_end:
+        command = command[:heredoc_end.start() + 4]  # keep the \nEOF
+
+    # Case 2: generic — strip trailing `", "some_key": ...` leakage
+    command = re.sub(
+        r'",\s*"(?:timeout|description|run_in_background|dangerouslyDisableSandbox)[^}]*$',
+        '', command
+    )
+    return command.strip()
+
+
+def _parse_simple_response(raw: str) -> list:
+    """
+    Parse a response in normal API mode.
+    Just returns the raw text as a text content block.
+    """
+    # Strip any prompt echo that might be included
+    raw = raw.strip()
+    if not raw:
+        return [{"type": "text", "text": ""}]
+    return [{"type": "text", "text": raw}]
+
 
 def _parse_claude_response(raw: str, available_tools: list) -> list:
     """
-    Parse Claude's text response into Anthropic content blocks.
+    Parse an LLM text response into Anthropic content blocks for Claude Code mode.
 
-    FIX #2: BROADER PARSER
-    Claude's web UI sometimes produces:
-      a) Proper <tool_call> blocks  ← handled by primary path
-      b) JSON inside ```json ... ``` code fences  ← NEW fallback
-      c) Plain text description of what it wants to do  ← kept as text block
+    Per <tool_call> block, three parse attempts are made in order:
+    1. _fix_unescaped_control_chars → json.loads (fixes bare newlines in strings)
+    2. json.loads on original raw_json (already-valid JSON)
+    3. _fallback_extract_tool_call (regex positional, last resort)
 
-    The prefill trick makes (a) the common case; (b) is a safety net.
+    After parsing, required fields are validated. Blocks with missing required
+    fields are dropped (logged as WARNING) rather than passed to Claude Code
+    where they would cause InputValidationError loops.
     """
     tool_names = {t.get("name", "").lower(): t.get("name", "") for t in available_tools}
 
-    # Because we append "Assistant: <tool_call>" as a prefill, Claude's scraped
-    # response often starts directly with the JSON body (the web UI only returns
-    # what Claude *added*, not what was pre-filled).  Normalise this.
     stripped = raw.strip()
     if stripped and not stripped.startswith("<tool_call>"):
-        # Check if the response is just the JSON continuation of our prefill
         if stripped.startswith("{") or stripped.startswith('{"'):
             stripped = f"<tool_call>{stripped}"
-            # Close the tag if it's missing
             if "</tool_call>" not in stripped:
                 stripped = stripped + "</tool_call>"
-            raw = stripped
+        raw = stripped
+
+    # Handle truncated tool_call (no closing tag)
+    if "<tool_call>" in raw and "</tool_call>" not in raw:
+        start_idx = raw.find("<tool_call>")
+        if start_idx != -1:
+            potential_json = raw[start_idx + len("<tool_call>"):].strip()
+            if potential_json.startswith("{"):
+                tool_match = re.search(r'"tool"\s*:\s*"([^"]+)"', potential_json)
+                if tool_match:
+                    print(f"[parser] Detected truncated tool_call with tool: {tool_match.group(1)}")
+                    raw = f"<tool_call>{potential_json}</tool_call>"
 
     blocks = []
     pattern = re.compile(r"<tool_call>(.*?)</tool_call>", re.DOTALL)
@@ -288,54 +671,113 @@ def _parse_claude_response(raw: str, available_tools: list) -> list:
         raw_json = re.sub(r"^```(?:json)?\s*", "", raw_json)
         raw_json = re.sub(r"\s*```$", "", raw_json)
 
-        # Fix common Claude dunder-stripping bug
+        # Fix common dunder-stripping bug
         raw_json = raw_json.replace('if name == "main":', "if __name__ == '__main__':")
         raw_json = raw_json.replace("if name == 'main':", "if __name__ == '__main__':")
 
+        call_data = None
+
+        # ── Attempt 1: repair unescaped control chars, then json.loads ────────
+        # Fixes ChatGPT's habit of writing literal newlines inside JSON strings.
         try:
-            call_data = json.loads(raw_json)
+            repaired = _fix_unescaped_control_chars(raw_json)
+            call_data = json.loads(repaired)
+            call_data["input"] = _unescape_string_values(call_data.get("input", {}))
+            if repaired != raw_json:
+                print("[parser] json.loads succeeded after control-char repair")
+        except json.JSONDecodeError:
+            pass
+
+        # ── Attempt 2: raw json.loads (already valid JSON) ────────────────────
+        if call_data is None:
+            try:
+                call_data = json.loads(raw_json)
+                call_data["input"] = _unescape_string_values(call_data.get("input", {}))
+            except json.JSONDecodeError as e:
+                print(f"[parser] json.loads failed ({e}), trying fallback extractor")
+
+                # ── Attempt 3: regex positional fallback ──────────────────────
+                call_data = _fallback_extract_tool_call(raw_json)
+                if call_data:
+                    print(f"[parser] Fallback extractor succeeded for tool: {call_data.get('tool')}")
+                else:
+                    print(f"[parser] Fallback extractor also failed for: {raw_json[:120]!r}")
+
+        if call_data:
             raw_name = call_data.get("tool", "")
-            inp = call_data.get("input", {})
-            resolved_name = tool_names.get(raw_name.lower(), raw_name)
+            inp      = call_data.get("input", {})
+
+            # Sanitize Python content for write-type tools
+            if raw_name.lower() in ("write", "create_file") and "content" in inp:
+                inp["content"] = _sanitize_python_content(inp["content"])
+            # Fix broken decorators and strip leaked JSON params from Bash commands
+            if raw_name.lower() == "bash" and "command" in inp:
+                inp["command"] = _strip_bash_command_garbage(inp["command"])
+                inp["command"] = _sanitize_python_content(inp["command"])
+
+            # Validate required fields — drop silently broken tool calls
+            missing = _validate_tool_input(raw_name, inp, available_tools)
+            if missing:
+                print(
+                    f"[parser] WARNING: tool {raw_name!r} missing required fields "
+                    f"{missing} — dropping block to prevent InputValidationError loop"
+                )
+                if not found_tool:
+                    blocks.append({"type": "text", "text": match.group(0)})
+                last_end = match.end()
+                continue
+
+            resolved = tool_names.get(raw_name.lower(), raw_name)
             blocks.append({
                 "type": "tool_use",
-                "id": f"toolu_{uuid.uuid4().hex[:24]}",
-                "name": resolved_name,
+                "id":   f"toolu_{uuid.uuid4().hex[:24]}",
+                "name": resolved,
                 "input": inp,
             })
             found_tool = True
-        except json.JSONDecodeError as e:
-            print(f"[parser] Failed to parse tool JSON: {raw_json!r} — {e}")
+        else:
             if not found_tool:
                 blocks.append({"type": "text", "text": match.group(0)})
 
         last_end = match.end()
 
-    # ── FIX #2b: JSON CODE-FENCE FALLBACK ─────────────────────────────────────
-    # If no <tool_call> was found, look for ```json blocks that might contain a
-    # tool call object.  Claude sometimes falls back to this format.
+    # ── JSON code-fence fallback (no <tool_call> found at all) ────────────────
     if not found_tool:
         fence_pattern = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL)
         for fm in fence_pattern.finditer(raw):
             try:
-                obj = json.loads(fm.group(1))
+                repaired = _fix_unescaped_control_chars(fm.group(1))
+                obj = json.loads(repaired)
                 if "tool" in obj and "input" in obj:
-                    raw_name = obj.get("tool", "")
-                    resolved_name = tool_names.get(raw_name.lower(), raw_name)
+                    raw_name     = obj.get("tool", "")
+                    resolved     = tool_names.get(raw_name.lower(), raw_name)
+                    obj["input"] = _unescape_string_values(obj.get("input", {}))
+
+                    if raw_name.lower() in ("write", "create_file") and "content" in obj["input"]:
+                        obj["input"]["content"] = _sanitize_python_content(obj["input"]["content"])
+                    if raw_name.lower() == "bash" and "command" in obj["input"]:
+                        obj["input"]["command"] = _strip_bash_command_garbage(obj["input"]["command"])
+                        obj["input"]["command"] = _sanitize_python_content(obj["input"]["command"])
+
+                    missing = _validate_tool_input(raw_name, obj["input"], available_tools)
+                    if missing:
+                        print(f"[parser] WARNING: fence fallback tool {raw_name!r} missing required fields: {missing}")
+                        continue
+
                     blocks = [{
                         "type": "tool_use",
-                        "id": f"toolu_{uuid.uuid4().hex[:24]}",
-                        "name": resolved_name,
+                        "id":   f"toolu_{uuid.uuid4().hex[:24]}",
+                        "name": resolved,
                         "input": obj.get("input", {}),
                     }]
                     found_tool = True
-                    last_end = len(raw)
+                    last_end   = len(raw)
                     print(f"[parser] Recovered tool call from JSON code fence: {raw_name}")
                     break
             except json.JSONDecodeError:
                 pass
 
-    # Trailing text — only include when no tool was found
+    # Trailing text — only when no tool was found
     if not found_tool:
         remaining = raw[last_end:].strip()
         if remaining:
@@ -373,11 +815,57 @@ def _is_internal_only(messages: list, max_tokens: int | None) -> bool:
     return _extract_last_user_message_text(messages) == ""
 
 
+# ── Fix 1: Context-aware _needs_tool_call ─────────────────────────────────────
+
 def _needs_tool_call(messages: list) -> bool:
-    """Return True if the last user turn looks like it should trigger a tool."""
+    """
+    Return True only if the original user request contains action keywords AND
+    the most recent tool result does not signal successful completion.
+
+    Without the completion check, every turn for "make a file" would keep
+    triggering the correction prompt even after Write succeeded — causing the
+    model to emit junk tool calls like TaskList in an infinite loop.
+    """
     text = _extract_last_user_message_text(messages).lower()
     if not text:
         return False
+
+    completion_signals = [
+        "updated successfully",
+        "created successfully",
+        "written successfully",
+        "deleted successfully",
+        "no tasks found",
+        "task complete",
+        "file has been",
+        "successfully written",
+        "successfully created",
+        "successfully updated",
+        "successfully deleted",
+    ]
+    for m in reversed(messages):
+        role    = m.role    if hasattr(m, "role")    else m.get("role", "")
+        content = m.content if hasattr(m, "content") else m.get("content", "")
+        if role != "user" or not isinstance(content, list):
+            continue
+        has_tool_result = False
+        for block in content:
+            if not isinstance(block, dict) or block.get("type") != "tool_result":
+                continue
+            has_tool_result = True
+            result_content = block.get("content", "")
+            if isinstance(result_content, list):
+                result_content = " ".join(
+                    b.get("text", "") for b in result_content
+                    if isinstance(b, dict)
+                )
+            result_lower = result_content.lower()
+            if any(sig in result_lower for sig in completion_signals):
+                print("[main] Completion signal found in last tool result — suppressing correction")
+                return False
+        if has_tool_result:
+            break
+
     action_keywords = [
         "create", "write", "run", "execute", "install", "make", "build",
         "delete", "read", "open", "save", "update", "fix", "edit", "modify",
@@ -454,15 +942,7 @@ async def _anthropic_stream(
 
 # ── Core query runner ──────────────────────────────────────────────────────────
 
-# FIX #3: CORRECTION PROMPT — sent as a follow-up when Claude ignores the format
-_CORRECTION_PROMPT = (
-    "Your previous response did not contain a <tool_call> block. "
-    "You MUST respond with ONLY a <tool_call> block — no explanation, "
-    "no preamble, no trailing text.\n\n"
-    "Correct format:\n"
-    "<tool_call>{\"tool\": \"TOOL_NAME\", \"input\": {...}}</tool_call>\n\n"
-    "Now output the correct <tool_call>:"
-)
+_CORRECTION_PROMPT = "Output only the <tool_call> block, nothing else."
 
 
 async def _run_query(
@@ -480,35 +960,171 @@ async def _run_query(
             return [{"type": "text", "text": '{"title": "New session"}'}]
         return [{"type": "text", "text": ""}]
 
-    prompt = _build_conversation_for_claude(messages, tools)
+    prompt = _build_prompt(messages, tools)
+    if _is_claude_mode():
+        print(f"[DEBUG] Prompt sent to Claude:\n{prompt}\n---")
 
     last_user = _extract_last_user_message_text(messages)
     print(f"[main] → LLM: {last_user[:100]}{'...' if len(last_user) > 100 else ''}")
-    print(f"[main] (context: {len(messages)} messages, {len(tools)} tools)")
+    print(f"[main] (context: {len(messages)} messages, {len(tools)} tools, mode={API_MODE})")
 
     try:
         raw = await worker.query(prompt)
         print(f"[main] ← LLM ({len(raw)} chars): {raw[:120]}{'...' if len(raw) > 120 else ''}")
 
-        blocks = _parse_claude_response(raw, tools)
+        if raw.startswith(prompt):
+            raw = raw[len(prompt):]
+            print(f"[main] Stripped prompt, remaining length: {len(raw)}")
+        else:
+            max_prefix = min(len(prompt), len(raw))
+            i = 0
+            while i < max_prefix and prompt[i] == raw[i]:
+                i += 1
+            if i > 30:
+                raw = raw[i:]
+                print(f"[main] Stripped common prefix of length {i}, remaining length: {len(raw)}")
+
+        # Parse response based on mode
+        if _is_claude_mode():
+            blocks = _parse_claude_response(raw, tools)
+        else:
+            blocks = _parse_simple_response(raw)
+
         tool_count = sum(1 for b in blocks if b["type"] == "tool_use")
         print(f"[main] parsed: {len(blocks)} blocks, {tool_count} tool_use")
 
-        # ── FIX #3: AUTOMATIC RETRY ON MISSING TOOL CALL ──────────────────────
-        # If tools were provided, we got only text back, AND the request looks
-        # like it should produce a tool call — send a correction follow-up.
-        if tools and tool_count == 0 and _needs_tool_call(messages):
+        # Tool call correction only applies in Claude mode
+        if _is_claude_mode() and tools and tool_count == 0 and _needs_tool_call(messages):
             print("[main] No tool call in response — sending correction prompt")
             correction = prompt + "\n\n" + raw + "\n\nUser: " + _CORRECTION_PROMPT + "\nAssistant: <tool_call>"
             raw2 = await worker.query(correction)
             print(f"[main] ← LLM retry ({len(raw2)} chars): {raw2[:120]}{'...' if len(raw2) > 120 else ''}")
+
+            if raw2.startswith(prompt):
+                raw2 = raw2[len(prompt):]
+            else:
+                max_prefix = min(len(prompt), len(raw2))
+                i = 0
+                while i < max_prefix and prompt[i] == raw2[i]:
+                    i += 1
+                if i > 30:
+                    raw2 = raw2[i:]
+
             blocks2 = _parse_claude_response(raw2, tools)
             tool_count2 = sum(1 for b in blocks2 if b["type"] == "tool_use")
             if tool_count2 > 0:
                 print(f"[main] Retry succeeded: {tool_count2} tool_use block(s)")
                 blocks = blocks2
             else:
-                print("[main] Retry also returned no tool_use — returning original text")
+                # ── Second retry: re-send the original prompt fresh ────────────
+                # The correction prompt failed — start a clean new chat and
+                # re-submit the original prompt so the model isn't confused by
+                # the prior bad exchange.
+                print("[main] Correction prompt also returned no tool_use — re-sending original prompt fresh")
+                raw3 = await worker.query(prompt)
+                print(f"[main] ← LLM fresh retry ({len(raw3)} chars): {raw3[:120]}{'...' if len(raw3) > 120 else ''}")
+
+                if raw3.startswith(prompt):
+                    raw3 = raw3[len(prompt):]
+                else:
+                    max_prefix = min(len(prompt), len(raw3))
+                    i = 0
+                    while i < max_prefix and prompt[i] == raw3[i]:
+                        i += 1
+                    if i > 30:
+                        raw3 = raw3[i:]
+
+                blocks3 = _parse_claude_response(raw3, tools)
+                tool_count3 = sum(1 for b in blocks3 if b["type"] == "tool_use")
+                if tool_count3 > 0:
+                    print(f"[main] Fresh retry succeeded: {tool_count3} tool_use block(s)")
+                    blocks = blocks3
+                else:
+                    print("[main] Fresh retry also returned no tool_use — returning original text")
+
+        # Tool deduplication only applies in Claude mode
+        if _is_claude_mode():
+            tool_blocks = [b for b in blocks if b.get("type") == "tool_use"]
+            if tool_blocks:
+                # ── Deduplicate against conversation history ───────────────────────
+                history_fingerprints: set[str] = set()
+                # Also track file-level fingerprints: tool_name + file_path only.
+                # This catches cases where fallback extractor truncates content
+                # differently each time, making full-input fingerprints differ
+                # even though it's the same logical Write/Read operation.
+                history_file_fingerprints: set[str] = set()
+                for m in messages:
+                    role = m.role if hasattr(m, "role") else m.get("role", "")
+                    content = m.content if hasattr(m, "content") else m.get("content", "")
+                    if role != "assistant" or not isinstance(content, list):
+                        continue
+                    for blk in content:
+                        if isinstance(blk, dict) and blk.get("type") == "tool_use":
+                            fp = json.dumps(
+                                {"name": blk.get("name"), "input": blk.get("input")},
+                                sort_keys=True
+                            )
+                            history_fingerprints.add(fp)
+                            # File-level: track Write attempts per file path
+                            blk_inp = blk.get("input", {})
+                            blk_name = blk.get("name", "").lower()
+                            if blk_name in ("write", "create_file") and "file_path" in blk_inp:
+                                history_file_fingerprints.add(
+                                    f"write::{blk_inp['file_path']}"
+                                )
+
+                if history_fingerprints:
+                    def _is_dup(b):
+                        full_fp = json.dumps(
+                            {"name": b.get("name"), "input": b.get("input")},
+                            sort_keys=True
+                        )
+                        if full_fp in history_fingerprints:
+                            return True
+                        # File-level dedup for Write tool
+                        b_name = b.get("name", "").lower()
+                        b_inp = b.get("input", {})
+                        if b_name in ("write", "create_file") and "file_path" in b_inp:
+                            file_fp = f"write::{b_inp['file_path']}"
+                            if file_fp in history_file_fingerprints:
+                                print(f"[main] File-level dedup hit for {b_inp['file_path']!r}")
+                                return True
+                        return False
+
+                    new_tool_blocks = [b for b in tool_blocks if not _is_dup(b)]
+                    removed = len(tool_blocks) - len(new_tool_blocks)
+                    if removed:
+                        print(f"[main] Deduped {removed} echoed history tool_call(s), {len(new_tool_blocks)} new remain")
+
+                    # Fix 2: Don't fall back to deduped blocks — return end_turn cleanly
+                    tool_blocks = new_tool_blocks
+
+                if tool_blocks:
+                    print(f"[main] Filtering out {len(blocks) - len(tool_blocks)} text blocks, keeping {len(tool_blocks)} tool_use blocks")
+                    return tool_blocks
+                else:
+                    # All blocks were duplicates. Instead of returning a text hint
+                    # (which ChatGPT ignores and loops on), synthesize a Read tool
+                    # call for the file that was being written. This gives Claude
+                    # Code a concrete next step and breaks the loop.
+                    written_files = []
+                    for b in tool_blocks:
+                        b_name = b.get("name", "").lower()
+                        b_inp = b.get("input", {})
+                        if b_name in ("write", "create_file") and "file_path" in b_inp:
+                            written_files.append(b_inp["file_path"])
+                    if written_files:
+                        fp = written_files[0]
+                        print(f"[main] All tool blocks duped — synthesizing Read for {fp!r}")
+                        return [{
+                            "type": "tool_use",
+                            "id": f"toolu_{uuid.uuid4().hex[:24]}",
+                            "name": "Read",
+                            "input": {"file_path": fp},
+                        }]
+                    else:
+                        print("[main] All tool blocks were duplicates (no file path) — returning end_turn")
+                        return [{"type": "text", "text": "Done."}]
 
         return blocks
 

@@ -1,8 +1,14 @@
 # web2api
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 **Turn any LLM web interface into an OpenAI-compatible API — no API key needed.**
 
 web2api uses [Playwright](https://playwright.dev/) to control a real Chrome browser session (one you're already logged in to) and exposes the result as a local REST API that speaks both the **Anthropic** (`/v1/messages`) and **OpenAI** (`/v1/chat/completions`) protocols.
+
+**Two modes of operation:**
+- **Claude Code mode** — Full tool support, message transformations, and Claude Code optimizations
+- **Normal mode** — Simple pass-through for general API use with any OpenAI-compatible client
 
 ### Supported providers
 
@@ -62,9 +68,9 @@ cd web2api
 pip install -r requirements.txt
 ```
 
-### 3. Choose your provider
+### 3. Configure the proxy
 
-Copy the example env file and set `TARGET_PROVIDER`:
+Copy the example env file and customize it:
 
 ```bash
 cp env.example .env
@@ -73,9 +79,28 @@ cp env.example .env
 Edit `.env`:
 
 ```env
-# Choose one: gemini | chatgpt | claude
+# ── Provider selection ─────────────────────────────────────────────────────────
+# Which LLM web interface to automate.
+# Choices: gemini | chatgpt | claude
 TARGET_PROVIDER=gemini
+
+# ── API Mode ───────────────────────────────────────────────────────────────────
+# Choose how the API processes requests:
+#   claude  - Claude Code optimized mode (default). Handles tool calls, message
+#             transformations, and deduplication for use with Claude Code.
+#   normal  - Standard LLM API mode. No special processing, just passes
+#             messages through to the web LLM and returns raw responses.
+API_MODE=claude
 ```
+
+**API Modes explained:**
+
+| Mode | Use case | Description |
+|------|----------|-------------|
+| `claude` (default) | Claude Code, coding agents | Full Claude Code optimizations including tool call parsing, message transformations, deduplication, and retry logic |
+| `normal` | General API use, other SDKs | Simple pass-through mode. Messages are formatted as conversations and raw responses are returned without special processing |
+
+If you're using Claude Code, keep `API_MODE=claude`. For other use cases (OpenAI SDK, custom scripts, etc.), set `API_MODE=normal`.
 
 ### 4. Start Chrome with remote debugging enabled
 
@@ -298,13 +323,27 @@ new_chat:    a[href='/new']
 
 ## Contributing
 
-PRs are welcome, especially for:
-- Updated/improved selectors for any provider
-- Support for additional providers (Perplexity, Mistral, etc.)
-- Better response extraction (e.g., handling code blocks separately)
+Contributions are welcome! Here are some areas where help is especially appreciated:
+
+- **Updated selectors**: Web UIs change frequently — PRs with updated selectors are always welcome
+- **New providers**: Support for Perplexity, Mistral, or other LLM web interfaces
+- **Better parsing**: Improved response extraction for complex formats
+- **Bug fixes**: Edge cases in tool call parsing or message handling
+
+Please ensure your code:
+- Passes existing functionality tests
+- Follows the existing code style
+- Includes appropriate comments for complex logic
+- Updates documentation if behavior changes
 
 ---
 
 ## License
 
-MIT
+MIT License — see [LICENSE](LICENSE) for details.
+
+---
+
+## Disclaimer
+
+This project automates web interfaces that may have Terms of Service restricting automated access. Use responsibly and at your own risk. This tool is intended for personal development and educational purposes only.
