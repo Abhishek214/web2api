@@ -22,6 +22,19 @@ web2api uses [Playwright](https://playwright.dev/) to control a real Chrome brow
 
 ---
 
+## Known Limitations & Gotchas
+
+### Hallucinations with smaller models
+Smaller models (e.g. Gemini Flash Lite, GPT-3.5) are more prone to hallucinating tool call formats. **Use mid-tier or larger models where possible.** In practice, **Gemini works best for tool calls** — it reliably follows structured output instructions and handles the tool call format more consistently than other providers.
+
+### Claude.ai system prompt override
+Claude.ai has an internal system prompt that nudges the model toward conversational, human-friendly output. This makes it difficult to force Claude to respond strictly in a structured tool call format. Bypassing this behaviour is non-trivial — attempts via injected system prompts have limited effect. If reliable tool call output is critical, prefer Gemini or ChatGPT as the backend provider.
+
+### Using with other agents
+The proxy's system prompt is tuned for Claude Code. If you want to use web2api with a different agent framework (LangChain, AutoGen, CrewAI, etc.), you'll likely need to adjust the system prompt in `main.py` to match that agent's expected format and conventions. The relevant section is clearly commented in the source — feel free to modify it to suit your use case.
+
+---
+
 ## How it works
 
 ```
@@ -309,6 +322,7 @@ new_chat:    a[href='/new']
 - **Multiple providers at once** — run two instances of the proxy on different ports (e.g. 8000 for Gemini, 8001 for ChatGPT), each with its own `TARGET_PROVIDER` in their respective `.env` files.
 - **Selector stability** — prefer `data-testid` attributes over class names; they tend to survive UI redesigns.
 - **Streaming** — the proxy re-streams the complete response word-by-word to emulate token streaming. True token-level streaming is not possible via web scraping.
+- **Model size matters** — if you're seeing hallucinated or malformed tool call responses, switch to a mid-tier or larger model. Smaller models struggle to follow strict output formats reliably.
 
 ---
 
@@ -318,6 +332,12 @@ new_chat:    a[href='/new']
 - **No multimodal support** — images and file uploads in the request are ignored.
 - **Selector fragility** — web UIs change; expect occasional selector updates.
 - **Terms of Service** — automating web interfaces may violate the provider's ToS. Use responsibly and for personal/dev use only.
+
+---
+
+## Roadmap
+
+- **Incognito mode support** — launch Chrome in incognito so the browser starts with a clean slate every time, preventing past chat memory or session state from leaking into new requests. This will make behaviour more predictable and stateless across runs.
 
 ---
 
